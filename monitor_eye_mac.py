@@ -1,0 +1,601 @@
+#!/usr/bin/env python3
+"""
+Monitor Eye (Mac Edition)
+─────────────────────────
+F1  → Capture & Analyze
+F2  → Clear Telegram chat
+Ctrl+Shift+Q → Quit
+"""
+
+import anthropic
+import base64
+import html
+import io
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import threading
+import urllib.request
+import urllib.parse
+from pathlib import Path
+from pynput import keyboard
+
+# ============================================================
+#  CONFIG
+# ============================================================
+
+CAPTURE_HOTKEY = {keyboard.Key.f1}
+CLEAR_HOTKEY   = {keyboard.Key.f2}
+QUIT_HOTKEY    = {keyboard.Key.ctrl_l, keyboard.Key.shift_l, keyboard.KeyCode.from_char('q')}
+
+MODEL = os.getenv("MODEL", "claude-sonnet-5")
+
+# ── Capture source ──────────────────────────────────────────
+# "screen"  → grab the whole Mac display with `screencapture` (default)
+# "device"  → grab a frame straight from a video capture card via ffmpeg
+CAPTURE_SOURCE = os.getenv("CAPTURE_SOURCE", "screen")
+
+# For CAPTURE_SOURCE="device": select the AVFoundation device BY NAME, not index —
+# indices reshuffle when iPhone Continuity cameras register/deregister.
+# List devices:  ffmpeg -f avfoundation -list_devices true -i ""
+VIDEO_DEVICE       = os.getenv("VIDEO_DEVICE", "USB Video")
+VIDEO_SIZE         = os.getenv("VIDEO_SIZE", "1920x1080")   # must match a mode the device reports
+VIDEO_FRAMERATE    = os.getenv("VIDEO_FRAMERATE", "60")
+VIDEO_PIXEL_FORMAT = os.getenv("VIDEO_PIXEL_FORMAT", "uyvy422")
+
+# Seconds to wait before a SCREEN capture so you can switch windows.
+# Not used for device capture (external feed needs no switch), so it's ~instant.
+CAPTURE_DELAY = float(os.getenv("CAPTURE_DELAY", "3"))
+
+SYSTEM_PROMPT = (
+    "You are an expert software engineering interview coach and coding assistant. "
+    "You will be given a screenshot of a screen showing an interview or coding problem. "
+    "IMPORTANT: Scan the ENTIRE screen carefully before responding.\n\n"
+
+    "First, classify the problem into exactly one of these types:\n"
+    "- CODING: There is a code editor visible with a language selector (C++, Python, Java, etc) "
+    "and a function/class template to fill in.\n"
+    "- SQL: The problem asks for a database query, or shows table schemas with no code editor.\n"
+    "- CONCEPTUAL: A written question, multiple choice, system design, or open-ended question "
+    "with no code editor.\n\n"
+
+    "Then respond based on the type:\n\n"
+
+    "CODING → "
+    "Read the language selector carefully (top of editor). "
+    "Copy the exact function/class signature shown. "
+    "Respond with:\n"
+    "- Line 1: Approach in plain English\n"
+    "- Line 2: Time and space complexity\n"
+    "- Then the full working solution in that language with brief inline comments, "
+    "wrapped in triple backticks.\n\n"
+
+    "SQL → "
+    "Write a clean, correct SQL query. "
+    "Add 1 line explaining the logic. "
+    "Wrap in triple backticks with sql tag.\n\n"
+
+    "CONCEPTUAL → "
+    "Give a concise, structured, interview-ready answer in plain text. "
+    "For multiple choice: read ALL answer choices carefully before deciding. "
+    "State the single correct answer letter and explain why it is correct in 2-3 sentences. "
+    "Then in one sentence explain why each other option is wrong. "
+    "For open-ended/system design: define the concept, key tradeoffs, and a brief example. "
+    "Max 200 words. No code unless essential.\n\n"
+
+    "NEVER refuse or ask for more info. Always commit to an answer based on what is visible."
+)
+
+USER_PROMPT = (
+    "Classify and answer the problem on screen. "
+    "If CODING: find the language selector and exact function signature, use them. "
+    "If SQL: write the query. "
+    "If CONCEPTUAL: answer concisely and structured. "
+    "Do not ask me anything — just answer."
+)
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
+
+# ============================================================
+#  CAPTURE
+# ============================================================
+
+TMP_CAPTURE = Path("/tmp/monitor_eye_capture.png")
+
+
+def _grab_screen(tmp_path: Path) -> bool:
+    """Grab the whole display to tmp_path with macOS screencapture."""
+    time.sleep(CAPTURE_DELAY)  # give yourself time to switch windows
+    try:
+        subprocess.run(["screencapture", "-x", "-t", "png", str(tmp_path)], timeout=5)
+    except subprocess.TimeoutExpired:
+        print("  Capture timed out")
+        return False
+    except Exception as e:
+        print(f"  Capture error: {e}")
+        return False
+    return tmp_path.exists()
+
+
+def _resolve_device_index(name: str) -> str:
+    """Look up a video device's current AVFoundation index by name.
+
+    ffmpeg 8.x can't open avfoundation devices by name (matching is broken), and
+    indices reshuffle when Continuity cameras come/go — so we resolve the index
+    fresh each capture. Returns the index as a string, or the name as a fallback.
+    """
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-nostdin", "-f", "avfoundation",
+             "-list_devices", "true", "-i", ""],
+            capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL,
+        )
+    except Exception:
+        return name  # let ffmpeg try the name and report its own error
+
+    # Video devices are listed before the "AVFoundation audio devices:" line.
+    for line in proc.stderr.splitlines():
+        if "AVFoundation audio devices" in line:
+            break
+        m = re.search(r"\[(\d+)\]\s+(.+?)\s*$", line)
+        if m and m.group(2) == name:
+            return m.group(1)
+    print(f"  Device '{name}' not in current list — check the connection")
+    return name
+
+
+def _grab_device(tmp_path: Path) -> bool:
+    """Grab one frame from a video capture card via ffmpeg avfoundation."""
+    device = _resolve_device_index(VIDEO_DEVICE)  # name -> current index
+    cmd = [
+        "ffmpeg", "-nostdin", "-y",
+        "-f", "avfoundation",
+        "-pixel_format", VIDEO_PIXEL_FORMAT,
+        "-video_size", VIDEO_SIZE,
+        "-framerate", VIDEO_FRAMERATE,
+        "-i", device,
+        "-frames:v", "1",
+        str(tmp_path),
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15,
+                              stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        print(f"  Device capture timed out — is '{VIDEO_DEVICE}' connected and "
+              f"does Terminal have Camera permission?")
+        return False
+    except FileNotFoundError:
+        print("  ffmpeg not found — install it (brew install ffmpeg)")
+        return False
+    if not tmp_path.exists():
+        # Surface the ffmpeg reason (wrong name, busy device, bad mode, etc.)
+        tail = "\n".join(proc.stderr.strip().splitlines()[-3:])
+        print(f"  Device capture failed:\n  {tail}")
+        return False
+    return True
+
+
+def capture_obs_window():
+    """Capture from the configured source and return JPEG bytes."""
+    tmp_path = TMP_CAPTURE
+
+    if CAPTURE_SOURCE == "device":
+        ok = _grab_device(tmp_path)
+    else:
+        ok = _grab_screen(tmp_path)
+
+    if not ok:
+        print("  Screenshot file not created")
+        return None
+
+    try:
+        from PIL import Image
+        img = Image.open(tmp_path)
+        buf = io.BytesIO()
+        img = img.convert("RGB")
+
+        max_dim = 1600
+        if max(img.size) > max_dim:
+            ratio = max_dim / max(img.size)
+            new_size = (int(img.width * ratio), int(img.height * ratio))
+            img = img.resize(new_size, Image.LANCZOS)
+
+        img.save(buf, format="JPEG", quality=85)
+        jpeg_bytes = buf.getvalue()
+        print(f"  Captured {img.width}x{img.height} ({len(jpeg_bytes) // 1024}KB)")
+        return jpeg_bytes
+
+    except Exception as e:
+        print(f"  Image processing error: {e}")
+        return None
+    finally:
+        # Keep tmp_path for OCR — deleted after ocr_screenshot() runs
+        pass
+
+
+_vision_ready = None  # None = untried, True/False = import result cached
+
+
+def _init_vision() -> bool:
+    """Import the macOS Vision framework once and cache the result."""
+    global _vision_ready
+    if _vision_ready is not None:
+        return _vision_ready
+    try:
+        import Vision  # noqa: F401  (pyobjc-framework-Vision)
+        import Foundation  # noqa: F401
+        globals()["Vision"] = Vision
+        globals()["Foundation"] = Foundation
+        _vision_ready = True
+    except Exception as e:
+        print(f"  Vision OCR unavailable ({e}); relying on Claude vision only")
+        _vision_ready = False
+    return _vision_ready
+
+
+def ocr_screenshot() -> str:
+    """Extract text from the screenshot using macOS Vision OCR (in-process)."""
+    tmp_path = Path("/tmp/monitor_eye_capture.png")
+    if not tmp_path.exists():
+        return ""
+    if not _init_vision():
+        tmp_path.unlink(missing_ok=True)
+        return ""
+    try:
+        url = Foundation.NSURL.fileURLWithPath_(str(tmp_path))
+        handler = Vision.VNImageRequestHandler.alloc().initWithURL_options_(url, {})
+        req = Vision.VNRecognizeTextRequest.alloc().init()
+        req.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
+        handler.performRequests_error_([req], None)
+        lines = []
+        for obs in (req.results() or []):
+            cands = obs.topCandidates_(1)
+            if cands:
+                lines.append(cands[0].string())
+        text = "\n".join(lines).strip()
+        if text:
+            print(f"  OCR extracted {len(text)} chars")
+        return text
+    except Exception as e:
+        print(f"  OCR skipped: {e}")
+        return ""
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+# ============================================================
+#  TELEGRAM
+# ============================================================
+
+SENT_IDS_PATH = Path("/tmp/monitor_eye_sent_ids.json")
+
+
+def _telegram_request(endpoint: str, payload: dict):
+    """Make a POST request to the Telegram Bot API."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{endpoint}"
+    data = urllib.parse.urlencode(payload).encode()
+    req = urllib.request.Request(url, data=data)
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read().decode())
+
+
+def _load_sent_ids() -> list:
+    """Load the list of message IDs this bot has sent (persists across restarts)."""
+    try:
+        return json.loads(SENT_IDS_PATH.read_text())
+    except Exception:
+        return []
+
+
+def _save_sent_ids(ids: list):
+    try:
+        SENT_IDS_PATH.write_text(json.dumps(ids))
+    except Exception:
+        pass
+
+
+def _record_sent_id(message_id: int):
+    ids = _load_sent_ids()
+    ids.append(message_id)
+    _save_sent_ids(ids)
+
+
+MAX_TG = 4096                                  # Telegram's per-message char limit
+_CODE_WRAP = len("<pre><code></code></pre>")    # overhead of wrapping a code block
+
+
+def _split_escaped(text: str, budget: int) -> list:
+    """Split raw text into pieces whose HTML-escaped length is <= budget,
+    breaking on line boundaries (and hard-splitting a single over-long line)."""
+    pieces, cur, cur_len = [], [], 0
+    for line in text.split("\n"):
+        line_len = len(html.escape(line)) + 1  # +1 for the newline
+        if cur and cur_len + line_len > budget:
+            pieces.append("\n".join(cur))
+            cur, cur_len = [], 0
+        if line_len > budget:
+            # A single line too long to fit — hard-split by characters.
+            s = line
+            while s:
+                lo, hi = 1, len(s)
+                while lo < hi:  # largest prefix whose escaped form fits
+                    mid = (lo + hi + 1) // 2
+                    if len(html.escape(s[:mid])) <= budget:
+                        lo = mid
+                    else:
+                        hi = mid - 1
+                pieces.append(s[:lo])
+                s = s[lo:]
+            continue
+        cur.append(line)
+        cur_len += line_len
+    if cur:
+        pieces.append("\n".join(cur))
+    return pieces
+
+
+def _telegram_messages(text: str) -> list:
+    """Turn Claude's markdown into a list of HTML messages, each <= MAX_TG,
+    never splitting inside an HTML tag or a code block."""
+    segments = re.split(r"(```(?:\w+)?\n?.*?```)", text, flags=re.DOTALL)
+    fragments = []  # each fragment is valid HTML and individually <= MAX_TG
+    for seg in segments:
+        if not seg:
+            continue
+        if seg.startswith("```"):
+            m = re.match(r"```(?:\w+)?\n?(.*?)```", seg, flags=re.DOTALL)
+            code = (m.group(1) if m else seg).strip()
+            for chunk in _split_escaped(code, MAX_TG - _CODE_WRAP):
+                fragments.append(f"<pre><code>{html.escape(chunk)}</code></pre>")
+        else:
+            for chunk in _split_escaped(seg, MAX_TG):
+                fragments.append(html.escape(chunk))
+
+    # Greedily pack fragments into as few messages as possible.
+    messages, buf = [], ""
+    for frag in fragments:
+        if buf and len(buf) + len(frag) > MAX_TG:
+            messages.append(buf)
+            buf = frag
+        else:
+            buf += frag
+    if buf:
+        messages.append(buf)
+    return messages
+
+
+def send_telegram(text: str):
+    """Format and send a message to Telegram as HTML, split safely at boundaries."""
+    messages = _telegram_messages(text)
+    try:
+        for msg in messages:
+            resp = _telegram_request("sendMessage", {
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": msg,
+                "parse_mode": "HTML",
+            })
+            mid = (resp.get("result") or {}).get("message_id")
+            if mid is not None:
+                _record_sent_id(mid)
+        print(f"  Sent to Telegram ({len(messages)} message(s)).")
+    except Exception as e:
+        print(f"  Telegram error: {e}")
+
+
+def clear_telegram():
+    """Delete the messages this bot has sent (tracked by ID, no ID-range guessing)."""
+    print("  Clearing Telegram chat...")
+    try:
+        ids = _load_sent_ids()
+        deleted = 0
+        for mid in ids:
+            try:
+                _telegram_request("deleteMessage", {
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "message_id": mid,
+                })
+                deleted += 1
+            except Exception:
+                # Message already gone, too old (>48h), or not ours — skip.
+                pass
+
+        _save_sent_ids([])  # reset the tracked set
+        print(f"  Cleared {deleted} messages from Telegram.")
+        send_telegram("<b>Chat cleared.</b>")
+
+    except Exception as e:
+        print(f"  Clear error: {e}")
+
+
+# ============================================================
+#  CLAUDE API
+# ============================================================
+
+client = None
+
+def init_client():
+    global client
+    try:
+        client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY", ""))
+    except Exception as e:
+        print(f"  API client error: {e}")
+        sys.exit(1)
+
+    # Validate the key NOW, not on the first F1 mid-interview.
+    try:
+        client.models.list(limit=1)
+        print("  Claude API client ready (key valid)")
+    except anthropic.AuthenticationError:
+        print("  ✗ ANTHROPIC_API_KEY is invalid or revoked — fix .env and restart.")
+        sys.exit(1)
+    except Exception as e:
+        # Network hiccup etc. — warn but don't block startup.
+        print(f"  Claude API client ready (key not verified: {e})")
+
+
+def analyze_image(jpeg_bytes: bytes, ocr_text: str = "") -> str:
+    img_b64 = base64.standard_b64encode(jpeg_bytes).decode("utf-8")
+    prompt = USER_PROMPT
+    if ocr_text:
+        prompt += f"\n\nHere is the exact text extracted from the screen via OCR — use this for accuracy:\n\n{ocr_text}"
+    try:
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=1024,
+            temperature=0,
+            system=SYSTEM_PROMPT,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/jpeg",
+                            "data": img_b64,
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": prompt,
+                    },
+                ],
+            }],
+        )
+        return "".join(block.text for block in response.content if block.type == "text")
+    except anthropic.APIError as e:
+        return f"API Error: {e}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ============================================================
+#  HOTKEY LISTENER
+# ============================================================
+
+current_keys = set()
+capturing = False
+
+
+def on_press(key):
+    global capturing
+    current_keys.add(key)
+
+    if QUIT_HOTKEY.issubset(current_keys):
+        print("\nQuitting Monitor Eye.")
+        return False
+
+    if CLEAR_HOTKEY.issubset(current_keys):
+        threading.Thread(target=clear_telegram, daemon=True).start()
+
+    if CAPTURE_HOTKEY.issubset(current_keys) and not capturing:
+        capturing = True
+        run_pipeline()
+        capturing = False
+
+
+def on_release(key):
+    current_keys.discard(key)
+
+
+def run_pipeline():
+    print("\n" + "=" * 60)
+    print("CAPTURING...")
+    print("=" * 60)
+
+    start = time.time()
+
+    jpeg_bytes = capture_obs_window()
+    if not jpeg_bytes:
+        print("  Capture failed. Try again.")
+        return
+
+    ocr_text = ocr_screenshot()
+
+    print("Sending to Claude...")
+    response = analyze_image(jpeg_bytes, ocr_text)
+    elapsed = time.time() - start
+
+    threading.Thread(target=send_telegram, args=(response,), daemon=True).start()
+
+    print("\n" + "-" * 60)
+    print(response)
+    print("-" * 60)
+    print(f"Done in {elapsed:.1f}s")
+    print("=" * 60)
+    print(f"\nReady — F1 capture | F2 clear Telegram")
+
+
+# ============================================================
+#  MAIN
+# ============================================================
+
+def test_capture():
+    """Grab a single frame from the configured source, save it, and open it.
+
+    Sanity-checks the capture path (and OCR) without starting the hotkey listener.
+    Usage: python3 monitor_eye_mac.py --test-capture
+    """
+    if CAPTURE_SOURCE == "device":
+        print(f"Test capture from device '{VIDEO_DEVICE}' "
+              f"({VIDEO_SIZE}@{VIDEO_FRAMERATE}, {VIDEO_PIXEL_FORMAT})...")
+    else:
+        print(f"Test capture from screen ({CAPTURE_DELAY:.0f}s delay)...")
+
+    jpeg_bytes = capture_obs_window()
+    if not jpeg_bytes:
+        print("  Capture FAILED — see the error above.")
+        sys.exit(1)
+
+    out = Path("/tmp/monitor_eye_test.jpg")
+    out.write_bytes(jpeg_bytes)
+    print(f"  Saved {len(jpeg_bytes) // 1024}KB → {out}")
+
+    # Also exercise OCR so you can see what text the model would receive.
+    _init_vision()
+    ocr_text = ocr_screenshot()
+    if ocr_text:
+        preview = ocr_text[:200].replace("\n", " ")
+        print(f"  OCR ({len(ocr_text)} chars): {preview}...")
+    else:
+        print("  OCR: no text extracted")
+
+    subprocess.run(["open", str(out)])
+    print("  Opened the captured frame. Looks right? Then run without --test-capture.")
+
+
+def main():
+    if "--test-capture" in sys.argv:
+        test_capture()
+        return
+
+    print(r"""
+    ╔══════════════════════════════════════╗
+    ║       Monitor Eye (Mac Edition)      ║
+    ╠══════════════════════════════════════╣
+    ║  F1  →  Capture & Analyze            ║
+    ║  F2  →  Clear Telegram chat          ║
+    ║  Ctrl+Shift+Q  →  Quit               ║
+    ╚══════════════════════════════════════╝
+    """)
+
+    print("Starting up...")
+    init_client()
+    _init_vision()  # warm the OCR framework so the first capture isn't slow
+    if CAPTURE_SOURCE == "device":
+        print(f"  Capture source: device '{VIDEO_DEVICE}' "
+              f"({VIDEO_SIZE}@{VIDEO_FRAMERATE}, {VIDEO_PIXEL_FORMAT})")
+    else:
+        print(f"  Capture source: screen ({CAPTURE_DELAY:.0f}s delay)")
+    print(f"\n  Ready. F1 to capture, F2 to clear Telegram.\n")
+
+    with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
+        listener.join()
+
+
+if __name__ == "__main__":
+    main()
