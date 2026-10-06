@@ -7,6 +7,8 @@
 .prompt-panel{margin-top:20px;padding:16px;background:#17202d;border:1px solid #283444;border-radius:12px}.prompt-panel label{display:block;font-size:13px;color:#a9b9cc;margin-bottom:8px}select,textarea{width:100%;font:inherit;font-size:16px;background:#10151e;color:#e8edf5;border:1px solid #3a4d64;border-radius:8px;padding:11px}textarea{min-height:130px;resize:vertical;line-height:1.5}#custom-panel{margin-top:14px}#save-note,#next-prompt,#used-prompt{font-size:13px;color:#a9b9cc;line-height:1.5;margin:8px 0 0}#used-prompt:empty{display:none}button:disabled,select:disabled{opacity:.55}.actions{display:flex;align-items:center;gap:12px;margin-top:10px}#save-note[data-error=true]{color:#ffb3ae}
 
 .tabs{display:flex;gap:8px;margin-top:18px}.tabs button{flex:1;font-size:15px}.tabs button[aria-selected=true]{border-color:#71ddc2;color:#71ddc2;background:#1b3334}.project-form{margin:18px 0;padding:16px;border:1px solid #283444;border-radius:12px;background:#17202d}.project-form label{display:block;font-size:13px;color:#a9b9cc;margin:12px 0 7px}.project-form label:first-child{margin-top:0}input{width:100%;background:#10151e;color:#e8edf5;border:1px solid #3a4d64;border-radius:8px;padding:11px;font:inherit;font-size:16px}.hint{font-size:13px;line-height:1.5;color:#a9b9cc}#project-status{color:#71ddc2;margin:16px 0}#project-active{overflow-wrap:anywhere}.chat-message{padding:14px;margin:12px 0;border:1px solid #283444;border-radius:12px;overflow-wrap:anywhere;line-height:1.6}.chat-message.user{background:#192c36}.chat-message .role{color:#91a0b4;font-size:12px;margin-bottom:6px}.chat-message p{margin:6px 0}#project-composer{margin-top:20px}#project-input{min-height:100px}#project-error{color:#ffb3ae}.actions{flex-wrap:wrap}
+
+.markdown{overflow-wrap:anywhere;min-width:0}.markdown p{white-space:normal;margin:.7em 0}.markdown>:first-child{margin-top:0}.markdown>:last-child{margin-bottom:0}.markdown h1,.markdown h2,.markdown h3,.markdown h4,.markdown h5,.markdown h6{line-height:1.3;letter-spacing:normal;margin:1.1em 0 .5em;font-weight:700}.markdown h1{font-size:1.5em}.markdown h2{font-size:1.3em}.markdown h3{font-size:1.15em}.markdown h4,.markdown h5,.markdown h6{font-size:1em}.markdown ul,.markdown ol{padding-left:1.5em;margin:.6em 0}.markdown li{margin:.3em 0}.markdown li>p{margin:.3em 0}.markdown li ul,.markdown li ol{margin:.25em 0}.markdown code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.9em;background:#202c3c;border-radius:4px;padding:.12em .3em;overflow-wrap:anywhere}.markdown pre code{font-size:inherit;background:none;border-radius:0;padding:0;white-space:inherit}.markdown blockquote{margin:1em 0;padding:.2em 0 .2em 1em;border-left:3px solid #71ddc2;color:#b6c8d9}.markdown a{color:#71ddc2;text-decoration:underline}.markdown hr{border:0;border-top:1px solid #36465b;margin:1.2em 0}.markdown .table-scroll{max-width:100%;overflow-x:auto;margin:1em 0}.markdown table{border-collapse:collapse;width:100%;font-size:.9em}.markdown th,.markdown td{border:1px solid #36465b;padding:8px;text-align:left;min-width:80px}.markdown th{background:#202c3c}.markdown .task-item{list-style:none}.markdown input[type=checkbox]{width:16px;height:16px;padding:0;margin:0 .5em 0 0;vertical-align:middle;accent-color:#71ddc2}
 </style>
 <header><h1>MonitorEye <span style="color:#71ddc2">Live</span></h1><span id="connection">Connecting…</span></header>
 <div class="prompt-panel"><label for="capture-target">F1 sends to</label><select id="capture-target"><option value="snapshot">Snapshot · separate answer each time</option><option value="project">Project session · keep context</option></select><div id="capture-note" class="hint" role="status"></div></div>
@@ -19,7 +21,7 @@
 <div id="next-prompt">Next F1: Auto</div><div id="save-note" role="status" aria-live="polite">Choose a style before pressing F1.</div>
 </section>
 <div id="used-prompt"></div>
-<div id="status">Ready</div><div id="timing"></div><article id="answer"><p class="empty">Keep this page open. Press F1 on your Mac to see the answer appear here.</p></article>
+<div id="status">Ready</div><div id="timing"></div><article id="answer" class="markdown"><p class="empty">Keep this page open. Press F1 on your Mac to see the answer appear here.</p></article>
 <footer><button id="copy">Copy answer</button><span style="margin-left:12px">F1 capture · F2 clear · F3 Opus retry</span></footer>
 </div>
 <div id="project-panel" role="tabpanel" aria-labelledby="project-tab" hidden>
@@ -35,9 +37,32 @@
 <div id="project-composer"><label for="project-input">Message or follow-up</label><textarea id="project-input" maxlength="12000" placeholder="Here is my goal… / How does this connect to the previous screenshot?"></textarea><div class="actions"><button id="project-send" disabled>Send</button></div><p id="project-error" role="alert"></p></div>
 <p class="hint">Context stays with this session until you start a new one, stop it, or restart MonitorEye. Long conversations may be summarized; resend any details Claude needs. F1 follows the selector above. F2 clears standalone answers; F3 retries the last standalone capture with Opus.</p>
 </div>
+<!-- MARKDOWN_LIBRARY -->
 <script>
 const $=id=>document.getElementById(id);let answer='',scheduled=false;
-function render(){scheduled=false;const el=$('answer');el.replaceChildren();if(!answer){const p=document.createElement('p');p.className='empty';p.textContent='Keep this page open. Press F1 on your Mac to see the answer appear here.';el.append(p);return}answer.split('```').forEach((part,i)=>{const node=document.createElement(i%2?'pre':'p');node.textContent=i%2?part.replace(/^[\w+#.-]*\n/,''):part;el.append(node)})}
+// Raw HTML and remote images remain text; only Markdown generates markup.
+const markdown=window.markdownit({html:false,breaks:true,linkify:false}).disable('image');
+const validateMarkdownLink=markdown.validateLink.bind(markdown);
+markdown.validateLink=url=>/^(https?:|mailto:)/i.test(url)&&validateMarkdownLink(url);
+markdown.renderer.rules.link_open=(tokens,index,options,env,self)=>{
+ tokens[index].attrSet('target','_blank');tokens[index].attrSet('rel','noopener noreferrer');
+ return self.renderToken(tokens,index,options);
+};
+function renderMarkdown(container,text){
+ container.classList.add('markdown');
+ container.innerHTML=markdown.render(text);
+ container.querySelectorAll('table').forEach(table=>{const wrapper=document.createElement('div');wrapper.className='table-scroll';table.replaceWith(wrapper);wrapper.append(table)});
+ container.querySelectorAll('li').forEach(item=>{
+  const content=item.firstElementChild?.tagName==='P'?item.firstElementChild:item;
+  const first=content.firstChild,match=first?.nodeType===Node.TEXT_NODE&&first.textContent.match(/^\[([ xX])\]\s+/);
+  if(match){first.textContent=first.textContent.slice(match[0].length);const box=document.createElement('input');box.type='checkbox';box.checked=match[1].toLowerCase()==='x';box.disabled=true;box.setAttribute('aria-label',box.checked?'Completed':'Not completed');content.prepend(box);item.classList.add('task-item')}
+ });
+}
+function render(){
+ scheduled=false;const el=$('answer');
+ if(!answer){el.replaceChildren();const p=document.createElement('p');p.className='empty';p.textContent='Keep this page open. Press F1 on your Mac to see the answer appear here.';el.append(p);return}
+ renderMarkdown(el,answer);
+}
 const query=new URLSearchParams(location.search),token=query.get('token');
 const labels={auto:'Auto',quick:'Quick answer',learn:'Explain / learn',review:'Review my code',custom:'Custom'};
 const storageKey='monitoreye.prompt.v1',draftKey='monitoreye.custom.v1';
@@ -99,7 +124,7 @@ $('project-repo').value=readSaved('monitoreye.repo')||'';
 function projectSource(){const repo=$('project-source').value==='repository';$('project-repo-panel').hidden=!repo;$('project-source-hint').textContent=repo?'Claude can read and search the selected local repository. F1 can also add screenshots.':'Start a session, then press F1 for each screen you want to share. Claude connects the screenshots and your follow-up messages. No repository access is needed.'}
 $('project-source').onchange=projectSource;
 $('capture-target').onchange=async()=>{const selector=$('capture-target');selector.disabled=true;try{await projectPost('/capture-target',{target:selector.value});$('capture-note').textContent='F1 destination saved.'}catch(error){$('capture-note').textContent='Could not confirm the F1 destination. Reconnect and try again.'}finally{selector.disabled=false}};
-function codeText(container,text){text.split('```').forEach((part,i)=>{const node=document.createElement(i%2?'pre':'p');node.textContent=i%2?part.replace(/^[\w+#.-]*\n/,''):part;container.append(node)})}
+
 function projectButtons(){const busy=projectAction||!!projectState?.busy;$('project-new').disabled=busy;$('project-send').disabled=busy||!projectState?.ready||!$('project-input').value.trim();$('project-stop').disabled=projectAction||!(projectState?.ready||projectState?.busy);$('project-repo').disabled=busy;$('project-model').disabled=busy;$('project-source').disabled=busy}
 function renderProject(state){
  projectState=state;$('project-status').textContent=state.status;
@@ -110,7 +135,7 @@ function renderProject(state){
  state.messages.forEach((message,i)=>{
   let entry=chat.children[i];
   if(!entry){entry=document.createElement('section');entry.className='chat-message '+message.role;const label=document.createElement('div');label.className='role';label.textContent=message.role==='user'?'You':'Claude';const content=document.createElement('div');entry.append(label,content);chat.append(entry)}
-  if(projectRendered[i]!==message.text){const content=entry.children[1];content.replaceChildren();codeText(content,message.text||'…');projectRendered[i]=message.text}
+  if(projectRendered[i]!==message.text){const content=entry.children[1];renderMarkdown(content,message.text||'…');projectRendered[i]=message.text}
  });
  projectButtons();
 }

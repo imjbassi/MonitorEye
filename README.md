@@ -21,7 +21,10 @@ Press F3 to retry the same image and OCR using **Opus 5.5, high effort**.
 Only the requested model runs; there is no automatic second call. F2 clears
 the standalone answer, cached capture, and standalone Claude conversations when idle.
 Ctrl+Shift+Q quits. No Telegram configuration or iPhone app installation is needed.
-The page streams text as Claude generates it, formats code blocks, and shows
+Both answer views render Markdown: **bold**, *italic*, bullet/numbered lists,
+headings, quotes, links, tables, task lists, and inline/fenced code. Code wraps on
+iPhone portrait screens. Copy answer preserves the original Markdown text.
+The page streams text as Claude generates it and shows
 capture, OCR, first-text and total timings. It never triggers captures from the phone.
 
 The viewer is a local HTTP server, not a hosted website. The private random link
@@ -295,7 +298,8 @@ To auto-start on login and keep running in the background, create a launchd plis
 ```
 
 Keep `claude_subscription.py`, `claude_session.py`, `capture_feed.py`,
-`live_view.py`, `live_view.html`, `prompt_presets.py`, and `project_session.py` beside `monitor_eye_mac.py`. Use `command -v claude`
+`live_view.py`, `live_view.html`, `prompt_presets.py`, `project_session.py`, and the
+`vendor/` folder beside `monitor_eye_mac.py`. Use `command -v claude`
 to find the `CLAUDE_BIN` path, and use the Python executable where you installed
 the dependencies. Log in interactively before starting the service.
 

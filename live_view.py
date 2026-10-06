@@ -60,6 +60,10 @@ class LiveView:
     def start(self):
         view = self
         page = Path(__file__).with_name("live_view.html").read_bytes()
+        # Bundle the parser into the authenticated page; no CDN or extra phone request.
+        markdown = (Path(__file__).parent / 'vendor' / 'markdown-it.min.js').read_bytes()
+        page = page.replace(b'<!-- MARKDOWN_LIBRARY -->',
+                            b'<script>\n' + markdown.replace(b'</script', b'<\\/script') + b'\n</script>')
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *args):
