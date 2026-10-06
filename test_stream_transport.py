@@ -1,47 +1,72 @@
-import json
+import os
 from pathlib import Path
-import subprocess
 import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
-from claude_subscription import ClaudeSubscription
+from claude_session import ClaudeSession
 
 
 class StreamTransportTests(unittest.TestCase):
-    def run_fake(self, script, timeout, callback):
-        # Invoke a real child process, replacing only the Claude command prefix.
-        real_popen = subprocess.Popen
-        with tempfile.TemporaryDirectory() as cwd:
-            path = Path(cwd) / 'fake.py'
-            path.write_text(script)
-            with patch('claude_subscription.shutil.which', return_value=sys.executable):
-                client = ClaudeSubscription(timeout=timeout)
-            def spawn(command, **kwargs):
-                return real_popen([sys.executable, '-u', str(path)], **kwargs)
-            with patch('claude_subscription.subprocess.Popen', side_effect=spawn):
-                return client._run([], '{}\n', on_event=callback)
+    def session(self, script, timeout=2):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name)/'fake.py'
+        path.write_text(script)
+        session = ClaudeSession([sys.executable,'-u',str(path)],os.environ.copy(),timeout)
+        self.addCleanup(session.close)
+        return session
 
-    def test_delivers_before_process_finishes(self):
-        received = []
-        started = time.monotonic()
-        result = self.run_fake('''import sys, time
-sys.stdin.read()
-print('{"type":"stream_event","event":{"delta":{"type":"text_delta","text":"hi"}}}', flush=True)
-time.sleep(0.5)
-print('{"type":"result","result":"hi"}', flush=True)
-''', 5, lambda event: received.append((time.monotonic(), event)))
-        self.assertEqual(result.returncode, 0)
-        self.assertEqual(len(received), 2)
-        self.assertGreater(received[1][0] - received[0][0], 0.3)
+    def message(self, text):
+        return {'type':'user','message':{'role':'user','content':text}}
 
-    def test_stalled_child_times_out(self):
-        started = time.monotonic()
-        with self.assertRaisesRegex(RuntimeError, 'timed out'):
-            self.run_fake('import time; time.sleep(10)', 0.15, lambda event: None)
-        self.assertLess(time.monotonic()-started, 3)
+    def test_persistent_reset_and_incremental_delivery(self):
+        session = self.session('''import sys,json,time
+for line in sys.stdin:
+ m=json.loads(line)['message']['content']
+ if m=='/clear':
+  print(json.dumps({'type':'result','local_command':'clear','result':''}),flush=True)
+ else:
+  print(json.dumps({'type':'stream_event','text':m}),flush=True)
+  time.sleep(.3)
+  print(json.dumps({'type':'result','result':m}),flush=True)
+''')
+        pid = session.process.pid
+        for text in ('red','blue'):
+            times=[]
+            result = session.request(self.message(text),lambda event: times.append(time.monotonic()))
+            self.assertEqual(result['result'],text)
+            self.assertEqual(len(times),1)
+            self.assertGreater(time.monotonic()-times[0],.2)
+            self.assertEqual(session.process.pid,pid)
+            self.assertTrue(session.alive)
 
+    def test_project_mode_keeps_context(self):
+        session = self.session('import sys,json\nseen=[]\nfor line in sys.stdin:\n text=json.loads(line)["message"]["content"]\n seen.append(text)\n print(json.dumps({"type":"result","result":"|".join(seen)}),flush=True)\n')
+        session.request(self.message('first'),clear_before=False)
+        result=session.request(self.message('second'),clear_before=False)
+        self.assertEqual(result['result'],'first|second')
 
-if __name__ == '__main__':
-    unittest.main()
+    def test_reset_failure_closes_before_next_image(self):
+        session = self.session('''import sys,json
+for line in sys.stdin:
+ print(json.dumps({'type':'result','result':'not a reset'}),flush=True)
+''')
+        session.request(self.message('first'))
+        with self.assertRaisesRegex(RuntimeError,'clear'):
+            session.request(self.message('second'))
+        self.assertFalse(session.alive)
+
+    def test_timeout_kills_worker(self):
+        session = self.session('import time;time.sleep(10)',.15)
+        start=time.monotonic()
+        with self.assertRaisesRegex(RuntimeError,'timed out'):
+            session.request(self.message('test'))
+        self.assertFalse(session.alive)
+        self.assertLess(time.monotonic()-start,3)
+
+    def test_crash_and_error_close_worker(self):
+        session=self.session('import sys;sys.exit(1)')
+        with self.assertRaisesRegex(RuntimeError,'disconnected'):
+            session.request(self.message('test'))
+        self.assertFalse(session.alive)

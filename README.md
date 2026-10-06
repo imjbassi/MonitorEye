@@ -19,7 +19,7 @@ Keep the page foregrounded for live updates; it reconnects and restores the late
 answer when reopened. Press F1 on the Mac to capture with **Sonnet 5.5, medium effort**.
 Press F3 to retry the same image and OCR using **Opus 5.5, high effort**.
 Only the requested model runs; there is no automatic second call. F2 clears
-the answer and cached capture when idle.
+the standalone answer, cached capture, and standalone Claude conversations when idle.
 Ctrl+Shift+Q quits. No Telegram configuration or iPhone app installation is needed.
 The page streams text as Claude generates it, formats code blocks, and shows
 capture, OCR, first-text and total timings. It never triggers captures from the phone.
@@ -35,6 +35,98 @@ Guest Wi-Fi/client isolation can prevent the phone reaching the Mac.
 `CAPTURE_DELAY=3` if you need time to switch windows. Existing `.env` values override
 the defaults. Set `TELEGRAM_ENABLED=1` to additionally deliver completed answers to
 Telegram using the existing bot settings.
+
+## Project sessions from screenshots
+
+No repo upload or local files are required. On the phone page, open **Project
+session**, keep **Screenshots only** selected, choose Sonnet or Opus, and press
+**Start session**. Starting a project sets **F1 sends to → Project session**.
+
+Show each relevant screen on your configured capture source (Mac display or
+capture card), then press **F1**. Each captured image and its OCR join the same
+conversation. Wait for the reply before adding another screenshot. Use the phone's
+**Message or follow-up** box to describe your goal, ask questions, or request code
+changes. Claude connects the screenshots and messages it has received; it cannot
+inspect unseen files, edit anything, or run commands. All tools are disabled for
+screenshot-only sessions. The phone shows the number of screenshots submitted.
+
+Switch **F1 sends to → Snapshot** for separate answers without ending the project.
+Switch it back to continue adding project screenshots. Merely browsing between
+the two tabs does not change F1's destination. **F2** clears standalone snapshots
+only; **F3** retries the last standalone capture with Opus. Neither resets or
+retries the project conversation. Snapshot prompt presets apply to standalone
+captures; give project instructions in the message box.
+
+**New session** clears the project context and can change the model/source.
+**Stop** cancels the project worker; start a new session afterward. F1 remains
+pointed at Project until you change its selector, so a stopped/failed project
+cannot silently turn into a standalone capture. A failed capture can be retried
+with F1 without losing context; a failed/timed-out Claude worker requires a new
+session. A capture in progress belongs to the session selected when F1 was
+pressed and is discarded if that session is stopped or replaced.
+
+The chat survives phone-page reloads while MonitorEye is running, but is held
+only in memory: restarting MonitorEye clears it. Long conversations may be
+compacted by Claude Code; resend screenshots if important details are missing.
+Start a new session after 100 exchanges (screenshots and text questions combined).
+Model calls still use your Claude subscription.
+
+### Optional local repository access
+
+Choose **Local repository** only if the repo is already available on this Mac.
+Enter its absolute folder path before starting the session. This optional mode
+adds Read, Glob, and Grep tools to inspect the repo and also accepts F1 screenshots.
+It cannot edit files or run shell commands. Claude Code's restricted mode confines
+file tools to the selected working directory; additional permissions are denied.
+Plugins, MCP servers, and project hooks are not loaded. This is permission
+scoping, not an operating-system sandbox. Keep the private viewer link private:
+anyone with it on your LAN can see the conversation and control project sessions.
+Use trusted Wi-Fi.
+
+## Choose a prompt before capturing
+
+Use **Prompt for your next capture** above the answer on the iPhone page:
+
+- **Auto**: detect coding, SQL, or conceptual questions (the original behavior).
+- **Quick answer**: answer first with minimal explanation.
+- **Explain / learn**: reasoning, a worked example, solution, and relevant complexity.
+- **Review my code**: bugs, edge cases, and the smallest useful correction.
+- **Custom**: enter up to 6,000 characters and tap **Save & use custom**.
+
+Wait for **Saved for the next capture** before pressing F1. The browser remembers
+your selection and custom text locally and reapplies them on reopening the same
+viewer address (a changed IP, port, or browser has separate storage). Editing
+custom text does not apply it until you save. If several viewers are open, the
+last saved selection controls the next capture; **Next F1** shows that selection.
+
+Each capture freezes its selected prompt before capture/OCR. **This answer** shows
+which prompt it used. F3 reuses that capture's prompt along with its image and OCR,
+even if you change the selector afterward. Changing a prompt makes no model call
+and does not capture the screen. Sonnet/Opus model choices remain independent.
+The private viewer link is also required to change prompt settings.
+
+## Faster repeated captures
+
+MonitorEye starts the Sonnet process during startup and keeps it alive. Opus gets
+its own process on the first F3 retry. Subsequent requests reuse those processes;
+login is checked only when starting or reconnecting a worker. Each standalone
+snapshot request first clears its previous conversation locally. Project sessions
+retain context instead. F2 clears standalone context without stopping healthy workers. A timeout or
+crash closes that worker; press F1/F3 to reconnect. No automatic model request is
+made at startup or during a context reset.
+
+With `CAPTURE_SOURCE=device`, one ffmpeg process keeps the capture card open.
+It drains video continuously at 10 frames/second for still-image sampling and
+holds only the latest complete frame. F1 waits for the next complete frame;
+it does not reuse an old frame. The configured input resolution and framerate
+remain unchanged. Device discovery runs only when opening/reconnecting, not on
+every capture. A stalled/disconnected feed is reopened once, then reports an
+error. This uses some CPU while idle and holds the card until MonitorEye exits.
+Do not open the same card in another app simultaneously.
+
+Both worker processes and the capture feed stop on Ctrl+C, Ctrl+Shift+Q, or SIGTERM.
+Restart MonitorEye after upgrading to activate these changes. These improvements
+remove local startup overhead; Claude's network/model latency still varies.
 
 ## How it works
 
@@ -202,7 +294,8 @@ To auto-start on login and keep running in the background, create a launchd plis
 </plist>
 ```
 
-Keep `claude_subscription.py` beside `monitor_eye_mac.py`. Use `command -v claude`
+Keep `claude_subscription.py`, `claude_session.py`, `capture_feed.py`,
+`live_view.py`, `live_view.html`, `prompt_presets.py`, and `project_session.py` beside `monitor_eye_mac.py`. Use `command -v claude`
 to find the `CLAUDE_BIN` path, and use the Python executable where you installed
 the dependencies. Log in interactively before starting the service.
 

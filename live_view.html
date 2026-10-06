@@ -3,17 +3,129 @@
 <style>
 :root{color-scheme:dark;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#10151e;color:#e8edf5}*{box-sizing:border-box}body{margin:0;padding:max(24px,env(safe-area-inset-top)) 20px 40px;max-width:860px;margin:auto}header{display:flex;align-items:center;justify-content:space-between}h1{font-size:23px;letter-spacing:-.7px}#connection{font-size:12px;color:#8ca4bd}#status{color:#71ddc2;margin:22px 0 8px}#timing{color:#91a0b4;font-size:12px;min-height:18px}article{font-size:18px;line-height:1.65;overflow-wrap:anywhere}p{white-space:pre-wrap}pre{background:#080d14;border:1px solid #283444;border-radius:12px;padding:16px;overflow:auto;font-size:14px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;max-width:100%;tab-size:4}button{background:#202c3c;color:#e8edf5;border:1px solid #36465b;border-radius:9px;padding:9px 13px;font:inherit;font-size:13px}footer{color:#91a0b4;font-size:13px;margin-top:30px}.empty{color:#91a0b4;margin-top:40px}
 @media (max-width:480px){body{padding-left:12px;padding-right:12px}pre{padding:12px;font-size:13px;line-height:1.55}}
+
+.prompt-panel{margin-top:20px;padding:16px;background:#17202d;border:1px solid #283444;border-radius:12px}.prompt-panel label{display:block;font-size:13px;color:#a9b9cc;margin-bottom:8px}select,textarea{width:100%;font:inherit;font-size:16px;background:#10151e;color:#e8edf5;border:1px solid #3a4d64;border-radius:8px;padding:11px}textarea{min-height:130px;resize:vertical;line-height:1.5}#custom-panel{margin-top:14px}#save-note,#next-prompt,#used-prompt{font-size:13px;color:#a9b9cc;line-height:1.5;margin:8px 0 0}#used-prompt:empty{display:none}button:disabled,select:disabled{opacity:.55}.actions{display:flex;align-items:center;gap:12px;margin-top:10px}#save-note[data-error=true]{color:#ffb3ae}
+
+.tabs{display:flex;gap:8px;margin-top:18px}.tabs button{flex:1;font-size:15px}.tabs button[aria-selected=true]{border-color:#71ddc2;color:#71ddc2;background:#1b3334}.project-form{margin:18px 0;padding:16px;border:1px solid #283444;border-radius:12px;background:#17202d}.project-form label{display:block;font-size:13px;color:#a9b9cc;margin:12px 0 7px}.project-form label:first-child{margin-top:0}input{width:100%;background:#10151e;color:#e8edf5;border:1px solid #3a4d64;border-radius:8px;padding:11px;font:inherit;font-size:16px}.hint{font-size:13px;line-height:1.5;color:#a9b9cc}#project-status{color:#71ddc2;margin:16px 0}#project-active{overflow-wrap:anywhere}.chat-message{padding:14px;margin:12px 0;border:1px solid #283444;border-radius:12px;overflow-wrap:anywhere;line-height:1.6}.chat-message.user{background:#192c36}.chat-message .role{color:#91a0b4;font-size:12px;margin-bottom:6px}.chat-message p{margin:6px 0}#project-composer{margin-top:20px}#project-input{min-height:100px}#project-error{color:#ffb3ae}.actions{flex-wrap:wrap}
 </style>
 <header><h1>MonitorEye <span style="color:#71ddc2">Live</span></h1><span id="connection">Connecting…</span></header>
+<div class="prompt-panel"><label for="capture-target">F1 sends to</label><select id="capture-target"><option value="snapshot">Snapshot · separate answer each time</option><option value="project">Project session · keep context</option></select><div id="capture-note" class="hint" role="status"></div></div>
+<nav class="tabs" role="tablist" aria-label="Work mode"><button id="snapshot-tab" role="tab" aria-selected="true" aria-controls="snapshot-panel">Snapshot</button><button id="project-tab" role="tab" aria-selected="false" aria-controls="project-panel">Project session</button></nav>
+<div id="snapshot-panel" role="tabpanel" aria-labelledby="snapshot-tab">
+<section class="prompt-panel" aria-label="Response style">
+<label for="preset">Prompt for your next capture</label>
+<select id="preset"><option value="auto">Auto</option><option value="quick">Quick answer</option><option value="learn">Explain / learn</option><option value="review">Review my code</option><option value="custom">Custom</option></select>
+<div id="custom-panel" hidden><label for="custom">Your instructions</label><textarea id="custom" maxlength="6000" placeholder="Example: Answer in Python, then explain the main idea in three short bullet points."></textarea><div class="actions"><button id="apply">Save &amp; use custom</button><span id="count">0 / 6000</span></div></div>
+<div id="next-prompt">Next F1: Auto</div><div id="save-note" role="status" aria-live="polite">Choose a style before pressing F1.</div>
+</section>
+<div id="used-prompt"></div>
 <div id="status">Ready</div><div id="timing"></div><article id="answer"><p class="empty">Keep this page open. Press F1 on your Mac to see the answer appear here.</p></article>
 <footer><button id="copy">Copy answer</button><span style="margin-left:12px">F1 capture · F2 clear · F3 Opus retry</span></footer>
+</div>
+<div id="project-panel" role="tabpanel" aria-labelledby="project-tab" hidden>
+<div class="project-form">
+<label for="project-source">Context source</label><select id="project-source"><option value="screenshots">Screenshots only · no repo needed</option><option value="repository">Local repository · optional</option></select>
+<div id="project-repo-panel" hidden><label for="project-repo">Repository folder on your Mac</label><input id="project-repo" type="text" autocapitalize="none" autocorrect="off" spellcheck="false" placeholder="/Users/you/code/my-project"></div>
+<label for="project-model">Model for new session</label><select id="project-model"><option value="sonnet">Sonnet 5.5 · medium effort</option><option value="opus">Opus 5.5 · high effort</option></select>
+<p class="hint"><span id="project-source-hint">Start a session, then press F1 for each screen you want to share. Claude connects the screenshots and your follow-up messages. No repository access is needed.</span> It can suggest changes, but cannot edit files or run commands.</p>
+<div class="actions"><button id="project-new">Start session</button><button id="project-stop" disabled>Stop</button></div>
+</div>
+<div id="project-active" class="hint"></div><div id="project-status" role="status">Start a session, then press F1 to add screenshots.</div>
+<div id="project-chat" aria-label="Project conversation"></div>
+<div id="project-composer"><label for="project-input">Message or follow-up</label><textarea id="project-input" maxlength="12000" placeholder="Here is my goal… / How does this connect to the previous screenshot?"></textarea><div class="actions"><button id="project-send" disabled>Send</button></div><p id="project-error" role="alert"></p></div>
+<p class="hint">Context stays with this session until you start a new one, stop it, or restart MonitorEye. Long conversations may be summarized; resend any details Claude needs. F1 follows the selector above. F2 clears standalone answers; F3 retries the last standalone capture with Opus.</p>
+</div>
 <script>
 const $=id=>document.getElementById(id);let answer='',scheduled=false;
 function render(){scheduled=false;const el=$('answer');el.replaceChildren();if(!answer){const p=document.createElement('p');p.className='empty';p.textContent='Keep this page open. Press F1 on your Mac to see the answer appear here.';el.append(p);return}answer.split('```').forEach((part,i)=>{const node=document.createElement(i%2?'pre':'p');node.textContent=i%2?part.replace(/^[\w+#.-]*\n/,''):part;el.append(node)})}
 const query=new URLSearchParams(location.search),token=query.get('token');
+const labels={auto:'Auto',quick:'Quick answer',learn:'Explain / learn',review:'Review my code',custom:'Custom'};
+const storageKey='monitoreye.prompt.v1',draftKey='monitoreye.custom.v1';
+let saving=false,drafting=false,restored=false,serverSelection=null;
+function readSaved(key){try{return localStorage.getItem(key)}catch{return null}}
+function writeSaved(key,value){try{localStorage.setItem(key,value);return true}catch{return false}}
+function controls(){
+ $('custom-panel').hidden=$('preset').value!=='custom';
+ $('count').textContent=$('custom').value.length+' / 6000';
+ $('apply').disabled=saving||!$('custom').value.trim();
+}
+function note(text,error=false){$('save-note').textContent=text;$('save-note').dataset.error=String(error)}
+function showSelection(selection){
+ $('preset').value=selection.preset;
+ if(selection.preset==='custom')$('custom').value=selection.custom;
+ controls();
+}
+async function applySelection(selection){
+ if(saving)return;
+ saving=true;$('preset').disabled=true;$('custom').disabled=true;controls();note('Saving…');
+ const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),5000);
+ try{
+  const response=await fetch('/prompt',{method:'POST',headers:{'Content-Type':'application/json','X-MonitorEye-Token':token||''},body:JSON.stringify(selection),signal:controller.signal});
+  if(!response.ok)throw new Error('Save failed');
+  const confirmed=await response.json();serverSelection=confirmed;drafting=false;showSelection(confirmed);
+  const remembered=writeSaved(storageKey,JSON.stringify(confirmed));
+  $('next-prompt').textContent='Next F1: '+labels[confirmed.preset];
+  note(remembered?'Saved for the next capture.':'Applied. This browser could not remember the setting.');
+ }catch{note('Could not confirm the change. Reconnect and try saving again before F1.',true)}
+ finally{clearTimeout(timer);saving=false;$('preset').disabled=false;$('custom').disabled=false;controls()}
+}
+$('custom').value=readSaved(draftKey)||'';controls();
+$('preset').onchange=()=>{
+ drafting=true;controls();
+ if($('preset').value==='custom'){note('Edit your instructions, then tap Save & use custom.');return}
+ applySelection({preset:$('preset').value,custom:$('custom').value});
+};
+$('custom').oninput=()=>{drafting=true;writeSaved(draftKey,$('custom').value);controls();note('Unsaved edits — tap Save & use custom to apply.')};
+$('apply').onclick=()=>applySelection({preset:'custom',custom:$('custom').value});
 const stream=new EventSource('/events?token='+encodeURIComponent(token||''));
-stream.onopen=()=>{$('connection').textContent='Connected';};
+stream.onopen=()=>{
+ $('connection').textContent='Connected';
+ if(!restored){
+  restored=true;
+  try{const saved=JSON.parse(readSaved(storageKey)||'null');if(saved&&labels[saved.preset]&&typeof saved.custom==='string'&&saved.custom.length<=6000&&(saved.preset!=='custom'||saved.custom.trim())){showSelection(saved);applySelection(saved)}}catch{}
+ }
+};
 stream.onerror=()=>{$('connection').textContent='Reconnecting…';};
-stream.onmessage=event=>{const state=JSON.parse(event.data);$('status').textContent=state.status;$('timing').textContent=state.timing;answer=state.text;if(!scheduled){scheduled=true;requestAnimationFrame(render)}};
+stream.onmessage=event=>{
+ const state=JSON.parse(event.data);$('capture-target').value=state.capture_target||'snapshot';$('capture-note').textContent=state.capture_notice||(state.capture_target==='project'?'F1 adds screenshots to your project conversation.':'F1 creates a standalone answer.');if(state.project)renderProject(state.project);$('status').textContent=state.status;$('timing').textContent=state.timing;
+ $('used-prompt').textContent=state.used_prompt?'This answer: '+state.used_prompt:'';
+ if(state.selection){serverSelection=state.selection;$('next-prompt').textContent='Next F1: '+labels[state.selection.preset];if(!saving&&!drafting)showSelection(state.selection)}
+ answer=state.text;if(!scheduled){scheduled=true;requestAnimationFrame(render)}
+};
+let projectState=null,projectAction=false,pendingMessage=null,projectRendered=[],renderedSession='';
+function tab(name){const project=name==='project';$('project-panel').hidden=!project;$('snapshot-panel').hidden=project;$('snapshot-tab').setAttribute('aria-selected',String(!project));$('project-tab').setAttribute('aria-selected',String(project))}
+$('snapshot-tab').onclick=()=>tab('snapshot');$('project-tab').onclick=()=>tab('project');
+$('project-repo').value=readSaved('monitoreye.repo')||'';
+function projectSource(){const repo=$('project-source').value==='repository';$('project-repo-panel').hidden=!repo;$('project-source-hint').textContent=repo?'Claude can read and search the selected local repository. F1 can also add screenshots.':'Start a session, then press F1 for each screen you want to share. Claude connects the screenshots and your follow-up messages. No repository access is needed.'}
+$('project-source').onchange=projectSource;
+$('capture-target').onchange=async()=>{const selector=$('capture-target');selector.disabled=true;try{await projectPost('/capture-target',{target:selector.value});$('capture-note').textContent='F1 destination saved.'}catch(error){$('capture-note').textContent='Could not confirm the F1 destination. Reconnect and try again.'}finally{selector.disabled=false}};
+function codeText(container,text){text.split('```').forEach((part,i)=>{const node=document.createElement(i%2?'pre':'p');node.textContent=i%2?part.replace(/^[\w+#.-]*\n/,''):part;container.append(node)})}
+function projectButtons(){const busy=projectAction||!!projectState?.busy;$('project-new').disabled=busy;$('project-send').disabled=busy||!projectState?.ready||!$('project-input').value.trim();$('project-stop').disabled=projectAction||!(projectState?.ready||projectState?.busy);$('project-repo').disabled=busy;$('project-model').disabled=busy;$('project-source').disabled=busy}
+function renderProject(state){
+ projectState=state;$('project-status').textContent=state.status;
+ $('project-active').textContent=state.session_id?('Active: '+(state.model==='opus'?'Opus 5.5':'Sonnet 5.5')+' · '+(state.source==='repository'?state.repo:'Screenshots only')+' · '+state.screenshots+' screenshot'+(state.screenshots===1?'':'s')):'';
+ $('project-new').textContent=state.session_id?'New session':'Start session';
+ const chat=$('project-chat');
+ if(renderedSession!==state.session_id||state.messages.length<projectRendered.length){renderedSession=state.session_id;projectRendered=[];chat.replaceChildren()}
+ state.messages.forEach((message,i)=>{
+  let entry=chat.children[i];
+  if(!entry){entry=document.createElement('section');entry.className='chat-message '+message.role;const label=document.createElement('div');label.className='role';label.textContent=message.role==='user'?'You':'Claude';const content=document.createElement('div');entry.append(label,content);chat.append(entry)}
+  if(projectRendered[i]!==message.text){const content=entry.children[1];content.replaceChildren();codeText(content,message.text||'…');projectRendered[i]=message.text}
+ });
+ projectButtons();
+}
+async function projectPost(path,data){
+ const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),10000);
+ try{const response=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json','X-MonitorEye-Token':token||''},body:JSON.stringify(data),signal:controller.signal});const result=await response.json();if(!response.ok)throw new Error(result.error||'Request failed.');return result}finally{clearTimeout(timer)}
+}
+async function projectActionRun(action){projectAction=true;projectButtons();$('project-error').textContent='';try{await action()}catch(error){$('project-error').textContent=error.name==='AbortError'?'Could not confirm the request. Check the session status before retrying.':error.message}finally{projectAction=false;projectButtons()}}
+$('project-new').onclick=()=>projectActionRun(async()=>{await projectPost('/project/start',{repo:$('project-repo').value,model:$('project-model').value,source:$('project-source').value});writeSaved('monitoreye.repo',$('project-repo').value);pendingMessage=null});
+$('project-input').oninput=()=>{pendingMessage=null;projectButtons()};
+$('project-send').onclick=()=>projectActionRun(async()=>{
+ const text=$('project-input').value,session=projectState.session_id;
+ if(!pendingMessage||pendingMessage.text!==text||pendingMessage.session_id!==session)pendingMessage={text,session_id:session,request_id:Date.now().toString(36)+'-'+Math.random().toString(36).slice(2)};
+ await projectPost('/project/message',pendingMessage);if($('project-input').value===text)$('project-input').value='';pendingMessage=null;
+});
+$('project-stop').onclick=()=>projectActionRun(()=>projectPost('/project/stop',{}));
 $('copy').onclick=async()=>{try{if(navigator.clipboard&&window.isSecureContext){await navigator.clipboard.writeText(answer)}else{const t=document.createElement('textarea');t.value=answer;document.body.append(t);t.select();t.setSelectionRange(0,t.value.length);if(!document.execCommand('copy'))throw Error();t.remove()}$('copy').textContent='Copied';}catch{$('copy').textContent='Select text to copy'}setTimeout(()=>$('copy').textContent='Copy answer',1800)};
 </script></html>

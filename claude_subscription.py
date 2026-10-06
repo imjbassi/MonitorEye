@@ -6,9 +6,8 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
-import queue
 import threading
-import time
+from claude_session import ClaudeSession
 
 
 class ClaudeSubscription:
@@ -31,6 +30,9 @@ class ClaudeSubscription:
         self.effort = effort
         self.model = model
         self.timeout = timeout
+        self.sessions = {}
+        self.lock = threading.RLock()
+        self.closed = False
 
     @staticmethod
     def _environment():
@@ -40,80 +42,65 @@ class ClaudeSubscription:
                 if not key.startswith(("ANTHROPIC_", "CLAUDE_CODE_USE_"))
                 and key not in ("CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_SIMPLE")}
 
-    def _run(self, args, payload=None, timeout=None, on_event=None):
-        # Avoid loading project context. Safe mode preserves subscription auth;
-        # --bare would disable it. No settings-based API key helpers are loaded.
-        with tempfile.TemporaryDirectory(prefix="monitoreye-claude-") as cwd:
+    def _run(self, args, timeout=20):
+        with tempfile.TemporaryDirectory(prefix="monitoreye-auth-") as cwd:
             try:
-                if on_event is not None:
-                    return self._stream(args, payload, cwd, on_event)
                 return subprocess.run(
                     [self.binary, "--safe-mode", "--setting-sources", "", *args],
-                    input=payload, capture_output=True, text=True,
-                    cwd=cwd, env=self._environment(),
-                    timeout=timeout if timeout is not None else self.timeout,
-                )
-            except subprocess.TimeoutExpired as exc:
-                raise RuntimeError("Claude Code timed out. Try again or increase CLAUDE_TIMEOUT.") from exc
-            except OSError as exc:
-                raise RuntimeError(f"Could not start Claude Code: {exc}") from exc
+                    capture_output=True, text=True, cwd=cwd, env=self._environment(), timeout=timeout)
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                raise RuntimeError(f"Claude Code login check failed: {exc}") from exc
 
-    def _stream(self, args, payload, cwd, on_event):
-        command = [self.binary, "--safe-mode", "--setting-sources", "", *args]
-        # Drain stdout while writing the image so neither pipe can deadlock.
-        with tempfile.TemporaryFile(mode="w+") as stderr:
-            process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                       stderr=stderr, text=True, cwd=cwd, env=self._environment())
-            events = queue.Queue()
+    def warm(self, system_prompt, model=None, effort=None):
+        """Start a worker without sending an image or making a model request."""
+        with self.lock:
+            if self.closed:
+                raise RuntimeError("Claude connection is closed.")
+            model, effort = model or self.model, effort or self.effort
+            if effort not in ("low", "medium", "high"):
+                raise ValueError("Effort must be low, medium, or high.")
+            key = (model, effort, system_prompt)
+            session = self.sessions.get(key)
+            if session and session.alive:
+                return session
+            if session:
+                session.close()
+                del self.sessions[key]
+            self.check_auth()  # Only when creating/reconnecting a worker.
+            if self.closed:
+                raise RuntimeError("Claude connection is closed.")
+            if len(self.sessions) >= 2:
+                self.sessions.pop(next(iter(self.sessions))).close()
+            args = [self.binary, "--safe-mode", "--setting-sources", "",
+                    "--print", "--input-format", "stream-json", "--output-format", "stream-json",
+                    "--verbose", "--include-partial-messages", "--model", model, "--effort", effort,
+                    "--system-prompt", system_prompt, "--tools", "", "--strict-mcp-config",
+                    "--no-session-persistence"]
+            # Safe mode disables customizations; built-in /clear must remain enabled.
+            session = ClaudeSession(args, self._environment(), self.timeout)
+            self.sessions[key] = session
+            if self.closed:
+                session.close()
+                raise RuntimeError("Claude connection is closed.")
+            return session
 
-            def read_output():
+    def reset(self):
+        """Clear both conversations while retaining healthy worker processes."""
+        with self.lock:
+            for key, session in list(self.sessions.items()):
                 try:
-                    for line in process.stdout:
-                        events.put(line)
-                finally:
-                    events.put(None)
+                    if not session.alive:
+                        raise RuntimeError("Worker exited")
+                    session.clear()
+                except RuntimeError:
+                    session.close()
+                    del self.sessions[key]
 
-            def write_input():
-                try:
-                    process.stdin.write(payload)
-                    process.stdin.close()
-                except (BrokenPipeError, OSError, ValueError):
-                    pass
-
-            reader = threading.Thread(target=read_output, daemon=True)
-            writer = threading.Thread(target=write_input, daemon=True)
-            reader.start()
-            writer.start()
-            deadline = time.monotonic() + self.timeout
-            lines = []
-            try:
-                while True:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise subprocess.TimeoutExpired(command, self.timeout)
-                    try:
-                        line = events.get(timeout=remaining)
-                    except queue.Empty:
-                        raise subprocess.TimeoutExpired(command, self.timeout)
-                    if line is None:
-                        break
-                    lines.append(line)
-                    try:
-                        event = json.loads(line)
-                    except ValueError:
-                        continue
-                    on_event(event)
-                process.wait(timeout=max(0.01, deadline - time.monotonic()))
-                stderr.seek(0)
-                return subprocess.CompletedProcess(command, process.returncode, "".join(lines), stderr.read())
-            finally:
-                if process.poll() is None:
-                    process.kill()
-                process.wait()
-                writer.join(timeout=1)
-                reader.join(timeout=1)
-                process.stdout.close()
-                process.stdin.close()
+    def close(self):
+        # Stop workers even when a request holds the client lock.
+        self.closed = True
+        for session in list(self.sessions.values()):
+            session.close()
 
     def check_auth(self):
         process = self._run(["auth", "status"], timeout=20)
@@ -130,8 +117,6 @@ class ClaudeSubscription:
         chosen_effort = effort or self.effort
         if chosen_effort not in ("low", "medium", "high"):
             raise ValueError("Effort must be low, medium, or high.")
-        # Recheck in case the user changed accounts since startup.
-        self.check_auth()
         message = {
             "type": "user",
             "message": {"role": "user", "content": [
@@ -148,23 +133,10 @@ class ClaudeSubscription:
             if delta.get("type") == "text_delta" and on_text:
                 on_text(delta.get("text", ""))
 
-        process = self._run([
-            "--print", "--input-format", "stream-json", "--output-format", "stream-json",
-            "--verbose", "--include-partial-messages",
-            "--model", model or self.model, "--effort", chosen_effort,
-            "--system-prompt", system_prompt,
-            "--tools", "", "--strict-mcp-config", "--disable-slash-commands",
-            "--no-session-persistence",
-        ], json.dumps(message) + "\n", on_event=receive if on_text else None)
-        try:
-            events = [json.loads(line) for line in process.stdout.splitlines() if line.strip()]
-            response = next((event for event in reversed(events)
-                             if isinstance(event, dict) and event.get("type") == "result"), None)
-        except ValueError as exc:
-            raise RuntimeError("Claude Code returned an invalid response. Check 'claude --version' and your login.") from exc
-        if not isinstance(response, dict):
-            raise RuntimeError("Claude Code returned no final result. Check your login and update Claude Code.")
-        if process.returncode or response.get("is_error"):
+        with self.lock:
+            session = self.warm(system_prompt, model=model, effort=chosen_effort)
+            response = session.request(message, receive)
+        if response.get("is_error"):
             detail = response.get("result") or "; ".join(str(e) for e in response.get("errors", []))
             raise RuntimeError(f"Claude Code request failed: {detail or 'check login and subscription usage limits'}")
         answer = response.get("result")

@@ -9,6 +9,10 @@ Ctrl+Shift+Q → Quit
 
 from claude_subscription import ClaudeSubscription
 from live_view import LiveView
+from prompt_presets import SYSTEM_PROMPT, default_selection, prompt_for
+from capture_feed import CaptureFeed
+import atexit
+import signal
 import html
 import io
 import json
@@ -57,53 +61,6 @@ TELEGRAM_ENABLED = os.getenv("TELEGRAM_ENABLED", "0") == "1"
 LIVE_PORT = int(os.getenv("LIVE_PORT", "8765"))
 live_view = None
 
-SYSTEM_PROMPT = (
-    "You are an expert software engineering interview coach and coding assistant. "
-    "You will be given a screenshot of a screen showing an interview or coding problem. "
-    "IMPORTANT: Scan the ENTIRE screen carefully before responding.\n\n"
-
-    "First, classify the problem into exactly one of these types:\n"
-    "- CODING: There is a code editor visible with a language selector (C++, Python, Java, etc) "
-    "and a function/class template to fill in.\n"
-    "- SQL: The problem asks for a database query, or shows table schemas with no code editor.\n"
-    "- CONCEPTUAL: A written question, multiple choice, system design, or open-ended question "
-    "with no code editor.\n\n"
-
-    "Then respond based on the type:\n\n"
-
-    "CODING → "
-    "Read the language selector carefully (top of editor). "
-    "Copy the exact function/class signature shown. "
-    "Respond with:\n"
-    "- Line 1: Approach in plain English\n"
-    "- Line 2: Time and space complexity\n"
-    "- Then the full working solution in that language with brief inline comments, "
-    "wrapped in triple backticks.\n\n"
-
-    "SQL → "
-    "Write a clean, correct SQL query. "
-    "Add 1 line explaining the logic. "
-    "Wrap in triple backticks with sql tag.\n\n"
-
-    "CONCEPTUAL → "
-    "Give a concise, structured, interview-ready answer in plain text. "
-    "For multiple choice: read ALL answer choices carefully before deciding. "
-    "State the single correct answer letter and explain why it is correct in 2-3 sentences. "
-    "Then in one sentence explain why each other option is wrong. "
-    "For open-ended/system design: define the concept, key tradeoffs, and a brief example. "
-    "Max 200 words. No code unless essential.\n\n"
-
-    "NEVER refuse or ask for more info. Always commit to an answer based on what is visible."
-)
-
-USER_PROMPT = (
-    "Classify and answer the problem on screen. "
-    "If CODING: find the language selector and exact function signature, use them. "
-    "If SQL: write the query. "
-    "If CONCEPTUAL: answer concisely and structured. "
-    "Do not ask me anything — just answer."
-)
-
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
@@ -112,10 +69,13 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 # ============================================================
 
 TMP_CAPTURE = Path("/tmp/monitor_eye_capture.png")
+capture_feed = None
+capture_feed_lock = threading.Lock()
 
 
 def _grab_screen(tmp_path: Path) -> bool:
     """Grab the whole display to tmp_path with macOS screencapture."""
+    tmp_path.unlink(missing_ok=True)
     time.sleep(CAPTURE_DELAY)  # give yourself time to switch windows
     try:
         subprocess.run(["screencapture", "-x", "-t", "png", str(tmp_path)], timeout=5)
@@ -133,7 +93,7 @@ def _resolve_device_index(name: str) -> str:
 
     ffmpeg 8.x can't open avfoundation devices by name (matching is broken), and
     indices reshuffle when Continuity cameras come/go — so we resolve the index
-    fresh each capture. Returns the index as a string, or the name as a fallback.
+    on each feed open/reconnect. Returns the index as a string, or the name as a fallback.
     """
     try:
         proc = subprocess.run(
@@ -155,35 +115,24 @@ def _resolve_device_index(name: str) -> str:
     return name
 
 
+def _get_capture_feed():
+    global capture_feed
+    with capture_feed_lock:
+        if capture_feed is None:
+            capture_feed = CaptureFeed(_resolve_device_index, VIDEO_DEVICE, VIDEO_SIZE,
+                                       VIDEO_FRAMERATE, VIDEO_PIXEL_FORMAT)
+        return capture_feed
+
+
 def _grab_device(tmp_path: Path) -> bool:
-    """Grab one frame from a video capture card via ffmpeg avfoundation."""
-    device = _resolve_device_index(VIDEO_DEVICE)  # name -> current index
-    cmd = [
-        "ffmpeg", "-nostdin", "-y",
-        "-f", "avfoundation",
-        "-pixel_format", VIDEO_PIXEL_FORMAT,
-        "-video_size", VIDEO_SIZE,
-        "-framerate", VIDEO_FRAMERATE,
-        "-i", device,
-        "-frames:v", "1",
-        str(tmp_path),
-    ]
+    tmp_path.unlink(missing_ok=True)
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15,
-                              stdin=subprocess.DEVNULL)
-    except subprocess.TimeoutExpired:
-        print(f"  Device capture timed out — is '{VIDEO_DEVICE}' connected and "
-              f"does Terminal have Camera permission?")
+        _get_capture_feed().snapshot(tmp_path)
+        return True
+    except Exception as exc:
+        print(f"  Device capture failed: {exc}")
         return False
-    except FileNotFoundError:
-        print("  ffmpeg not found — install it (brew install ffmpeg)")
-        return False
-    if not tmp_path.exists():
-        # Surface the ffmpeg reason (wrong name, busy device, bad mode, etc.)
-        tail = "\n".join(proc.stderr.strip().splitlines()[-3:])
-        print(f"  Device capture failed:\n  {tail}")
-        return False
-    return True
+
 
 
 def capture_obs_window():
@@ -425,19 +374,23 @@ def clear_telegram():
 client = None
 
 
-def init_client():
+def init_client(warm=True):
     global client
     try:
         client = ClaudeSubscription(model=MODEL, timeout=float(os.getenv("CLAUDE_TIMEOUT", "120")), effort=EFFORT)
-        client.check_auth()
+        if warm:
+            client.warm(SYSTEM_PROMPT)
+        else:
+            client.check_auth()
         print("  Claude Code ready (Claude account login; subscription limits apply)")
     except (RuntimeError, ValueError) as e:
         print(f"  Claude setup error: {e}")
         sys.exit(1)
 
 
-def analyze_image(jpeg_bytes: bytes, ocr_text: str = "", on_text=None, retry=False) -> str:
-    prompt = USER_PROMPT
+def analyze_image(jpeg_bytes: bytes, ocr_text: str = "", on_text=None, retry=False, selection=None) -> str:
+    preset_label, instructions = prompt_for(selection or default_selection())
+    prompt = f"Selected response style: {preset_label}\n\n{instructions}"
     if ocr_text:
         prompt += f"\n\nHere is the exact text extracted from the screen via OCR — use this for accuracy:\n\n{ocr_text}"
     try:
@@ -471,8 +424,10 @@ def on_press(key):
 
     if CLEAR_HOTKEY.issubset(current_keys) and not capturing:
         last_capture = None
+        if client:
+            client.reset()
         if live_view:
-            live_view.update(text="", status="Ready — press F1 on your Mac", timing="")
+            live_view.update(text="", status="Ready — press F1 on your Mac", timing="", used_prompt="")
         if TELEGRAM_ENABLED:
             threading.Thread(target=clear_telegram, daemon=True).start()
 
@@ -486,19 +441,36 @@ def on_press(key):
 
     if CAPTURE_HOTKEY.issubset(current_keys) and not capturing:
         capturing = True
-        threading.Thread(target=run_pipeline, daemon=True).start()
+        project_id = live_view.capture_destination() if live_view else None
+        threading.Thread(target=run_pipeline, kwargs={'project_id':project_id}, daemon=True).start()
 
 
 def on_release(key):
     current_keys.discard(key)
 
 
-def run_pipeline(retry=False):
+def run_pipeline(retry=False, project_id=None):
     global capturing, last_capture
+    if project_id is not None and not retry:
+        try:
+            live_view.update(capture_notice='')
+            live_view.project.capture(project_id, capture_obs_window, ocr_screenshot)
+        except Exception as exc:
+            print(f'  Project capture: {exc}')
+            live_view.update(capture_notice=str(exc))
+        finally:
+            capturing = False
+            TMP_CAPTURE.unlink(missing_ok=True)
+            print('Ready — F1 adds to the selected conversation; F2/F3 affect standalone snapshots.')
+        return
     start = time.monotonic()
     first_text = None
+    # Freeze the selection before capture/OCR so later phone changes affect only the next F1.
+    selection = (last_capture[2] if retry and last_capture else
+                 live_view.prompt_snapshot() if live_view else default_selection())
+    preset_label, _ = prompt_for(selection)
     if live_view:
-        live_view.update(text="", status="Retrying last capture…" if retry else "Capturing…", timing="")
+        live_view.update(text="", status="Retrying last capture…" if retry else "Capturing…", timing="", used_prompt=preset_label)
 
     def receive(text):
         nonlocal first_text
@@ -512,7 +484,7 @@ def run_pipeline(retry=False):
         if retry:
             if last_capture is None:
                 raise RuntimeError("Capture with F1 before retrying with F3.")
-            jpeg_bytes, ocr_text = last_capture
+            jpeg_bytes, ocr_text, selection = last_capture
             captured = ocr_done = start
         else:
             last_capture = None
@@ -524,11 +496,11 @@ def run_pipeline(retry=False):
                 live_view.update(status="Reading screenshot…")
             ocr_text = ocr_screenshot()
             ocr_done = time.monotonic()
-            last_capture = (jpeg_bytes, ocr_text)
+            last_capture = (jpeg_bytes, ocr_text, selection)
         label = f"{RETRY_MODEL} · {RETRY_EFFORT}" if retry else f"{MODEL} · {EFFORT}"
         if live_view:
             live_view.update(status=f"{label} — thinking…", timing=label)
-        response = analyze_image(jpeg_bytes, ocr_text, on_text=receive, retry=retry)
+        response = analyze_image(jpeg_bytes, ocr_text, on_text=receive, retry=retry, selection=selection)
         elapsed = time.monotonic() - start
         timing = label + (" · Reused capture" if retry else f" · Capture {captured-start:.1f}s · OCR {ocr_done-captured:.1f}s")
         if first_text is not None:
@@ -591,7 +563,7 @@ def test_capture():
 def main():
     global live_view
     if "--test-claude" in sys.argv:
-        init_client()
+        init_client(warm=False)
         return
 
     if "--test-capture" in sys.argv:
@@ -615,8 +587,14 @@ def main():
     print(f"\n  iPhone (same Wi-Fi): {live_view.phone_url()}")
     print(f"  This Mac: {live_view.url()}")
     print("  Keep the private viewer link open in Safari. It changes each restart.")
+    print("  Start a Project session on your phone to build context with F1 screenshots.")
     _init_vision()  # warm the OCR framework so the first capture isn't slow
     if CAPTURE_SOURCE == "device":
+        try:
+            _get_capture_feed().start()
+            print("  Capture feed kept open (latest frames only)")
+        except Exception as exc:
+            print(f"  Capture warm-up failed; F1 will retry: {exc}")
         print(f"  Capture source: device '{VIDEO_DEVICE}' "
               f"({VIDEO_SIZE}@{VIDEO_FRAMERATE}, {VIDEO_PIXEL_FORMAT})")
     else:
@@ -627,8 +605,25 @@ def main():
         with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
             listener.join()
     finally:
+        close_resources()
+
+
+def close_resources():
+    if client:
+        client.close()
+    if capture_feed:
+        capture_feed.close()
+    if live_view:
         live_view.close()
 
 
+atexit.register(close_resources)
+
 if __name__ == "__main__":
-    main()
+    def stop_on_signal(signum, frame):
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, stop_on_signal)
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
