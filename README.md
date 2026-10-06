@@ -1,23 +1,55 @@
 # MonitorEye
 
-Press a hotkey, get an interview-ready answer in your Telegram — instantly.
+Press F1 on your Mac and read the live answer in Safari on your iPhone.
 
-MonitorEye captures your screen, runs OCR to extract text, sends both to Claude for analysis, and delivers a structured answer to your Telegram chat. Works for LeetCode-style coding problems, SQL questions, multiple choice, and open-ended SWE interview questions.
+MonitorEye captures your screen, runs OCR to extract text, sends both to Claude for analysis, and streams a structured answer to your iPhone browser. Works for LeetCode-style coding problems, SQL questions, multiple choice, and open-ended SWE interview questions.
+
+## Live iPhone viewer (default)
+
+```bash
+cd ~/Desktop/MonitorEye
+source .venv/bin/activate
+# Optional: load your existing configuration
+# set -a; source .env; set +a
+python monitor_eye_mac.py
+```
+
+Open the **iPhone (same Wi-Fi)** link printed in Terminal on your iPhone in Safari.
+Keep the page foregrounded for live updates; it reconnects and restores the latest
+answer when reopened. Press F1 on the Mac to capture with **Sonnet 5.5, medium effort**.
+Press F3 to retry the same image and OCR using **Opus 5.5, high effort**.
+Only the requested model runs; there is no automatic second call. F2 clears
+the answer and cached capture when idle.
+Ctrl+Shift+Q quits. No Telegram configuration or iPhone app installation is needed.
+The page streams text as Claude generates it, formats code blocks, and shows
+capture, OCR, first-text and total timings. It never triggers captures from the phone.
+
+The viewer is a local HTTP server, not a hosted website. The private random link
+changes on restart; anyone with the link on the LAN can read the latest answer.
+Use a trusted Wi-Fi network. If macOS asks, allow incoming local connections for
+Python. For F1/F2, enable your launching app (Terminal, or Codex when launched
+from Codex) under System Settings → Privacy & Security → Accessibility, then restart
+MonitorEye. Screen capture also needs Screen Recording permission.
+Guest Wi-Fi/client isolation can prevent the phone reaching the Mac.
+`LIVE_PORT` defaults to 8765. Screen capture defaults to zero delay; set
+`CAPTURE_DELAY=3` if you need time to switch windows. Existing `.env` values override
+the defaults. Set `TELEGRAM_ENABLED=1` to additionally deliver completed answers to
+Telegram using the existing bot settings.
 
 ## How it works
 
-1. Press **F1** — screen is captured after a 3-second delay (time to switch windows)
+1. Press **F1** — screen is captured immediately by default
 2. OCR extracts all text from the screenshot for accuracy
 3. Claude classifies the problem type and generates an answer
-4. Answer is sent to your Telegram bot
+4. Answer streams to the phone viewer; optional Telegram delivery follows completion
 
 ## Features
 
 - Detects problem type automatically: **coding**, **SQL**, or **conceptual/MCQ**
 - Matches the exact language and function signature shown in the code editor
 - Interview-ready answers: approach, complexity, and full solution with inline comments
-- Sends to Telegram with proper code formatting
-- **F2** clears the Telegram chat between sessions
+- Streams to Safari on your iPhone, with optional Telegram delivery
+- **F2** clears the live answer when idle (and Telegram when enabled)
 - Runs as a background service — starts on boot, restarts on crash
 - Works with lid closed (use `sudo pmset -a disablesleep 1`)
 
@@ -25,27 +57,35 @@ MonitorEye captures your screen, runs OCR to extract text, sends both to Claude 
 
 - macOS (uses `screencapture` and Vision OCR)
 - Python 3.9+
-- An [Anthropic API key](https://console.anthropic.com/)
-- A Telegram bot token and chat ID ([setup guide](https://core.telegram.org/bots#how-do-i-create-a-bot))
+- [Claude Code](https://code.claude.com/docs/en/setup) installed and signed in with a paid Claude subscription (current version supporting `--safe-mode` and `auth status`)
+- Optional: a Telegram bot token and chat ID ([setup guide](https://core.telegram.org/bots#how-do-i-create-a-bot))
 
 ## Installation
 
 ```bash
-pip install anthropic pillow pynput pyobjc-framework-Vision
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install pillow pynput pyobjc-framework-Vision
+claude auth login
 ```
 
 `pyobjc-framework-Vision` powers the on-device OCR. If it's not installed, MonitorEye still works — it just relies on Claude's vision alone.
 
 ## Configuration
 
-Copy `.env.example` to `.env` and fill in your keys:
+Sign in with your Claude account when prompted (not an API/Console account).
+MonitorEye uses `claude -p` with your login. It removes API credentials and provider
+overrides from the child process and rejects non-Claude-account authentication.
+Subscription usage limits still apply; account-level extra usage, if enabled, can
+incur charges. [Current Anthropic guidance](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan).
+
+Optional: copy `.env.example` to `.env` to customize settings. Telegram credentials are only required when `TELEGRAM_ENABLED=1`:
 
 ```bash
 cp .env.example .env
 ```
 
 ```
-ANTHROPIC_API_KEY=sk-ant-...
 TELEGRAM_BOT_TOKEN=your_bot_token
 TELEGRAM_CHAT_ID=your_chat_id
 ```
@@ -53,9 +93,28 @@ TELEGRAM_CHAT_ID=your_chat_id
 Then export them before running:
 
 ```bash
-export $(cat .env | xargs)
+set -a
+source .env
+set +a
 python3 monitor_eye_mac.py
 ```
+
+Optional settings: `MODEL=claude-sonnet-5-5` (or another model your plan supports),
+`CLAUDE_TIMEOUT=120` (seconds), and `CLAUDE_BIN=/full/path/to/claude`.
+The default is pinned to Sonnet 5.5 with `CLAUDE_EFFORT=medium`. F3 uses
+`RETRY_MODEL=claude-opus-5-5` and `RETRY_EFFORT=high`. Update Claude Code with
+`claude update`; Sonnet 5.5 requires version 2.1.284 or newer.
+
+Check the local login without capturing your screen, calling the model, or sending Telegram messages:
+
+```bash
+python3 monitor_eye_mac.py --test-claude
+```
+
+If login is missing, run `claude auth login` in Terminal as the same macOS user
+that runs MonitorEye. Update an older CLI with `claude update`. The screenshot
+and OCR are passed together over stdin; Claude has no tools, MCP servers, or
+saved conversation in this flow. No API key is needed.
 
 ## Capture source (screen vs. capture card)
 
@@ -66,13 +125,13 @@ Set these in `.env`:
 
 ```
 CAPTURE_SOURCE=screen        # or "device"
-VIDEO_DEVICE=USB Video       # AVFoundation device name (NOT an index)
+VIDEO_DEVICE="USB Video"       # AVFoundation device name (NOT an index)
 VIDEO_SIZE=1920x1080         # must match a mode the device reports
 VIDEO_FRAMERATE=60
 VIDEO_PIXEL_FORMAT=uyvy422
 ```
 
-- `screen` — grabs the display with `screencapture` (waits `CAPTURE_DELAY`, default 3s).
+- `screen` — grabs the display with `screencapture` (waits `CAPTURE_DELAY`, default 0s).
 - `device` — grabs one frame via `ffmpeg` (`brew install ffmpeg`), near-instant.
 
 List available devices and their names:
@@ -95,7 +154,7 @@ ffmpeg -f avfoundation -pixel_format uyvy422 -video_size 1920x1080 \
 ## Testing the capture (`--test-capture`)
 
 Before a session, verify the capture path without launching the hotkey listener
-or spending an API call:
+or making a Claude request:
 
 ```bash
 set -a; source .env; set +a
@@ -124,8 +183,8 @@ To auto-start on login and keep running in the background, create a launchd plis
     </array>
     <key>EnvironmentVariables</key>
     <dict>
-        <key>ANTHROPIC_API_KEY</key>
-        <string>sk-ant-...</string>
+        <key>CLAUDE_BIN</key>
+        <string>/opt/homebrew/bin/claude</string>
         <key>TELEGRAM_BOT_TOKEN</key>
         <string>your_bot_token</string>
         <key>TELEGRAM_CHAT_ID</key>
@@ -142,6 +201,10 @@ To auto-start on login and keep running in the background, create a launchd plis
 </dict>
 </plist>
 ```
+
+Keep `claude_subscription.py` beside `monitor_eye_mac.py`. Use `command -v claude`
+to find the `CLAUDE_BIN` path, and use the Python executable where you installed
+the dependencies. Log in interactively before starting the service.
 
 Load it:
 
@@ -160,7 +223,8 @@ tail -f /tmp/monitoreye.log
 | Key | Action |
 |-----|--------|
 | F1 | Capture screen and analyze |
-| F2 | Clear Telegram chat |
+| F2 | Clear live answer and cached capture when idle |
+| F3 | Retry last capture with Opus 5.5, high effort |
 | Ctrl+Shift+Q | Quit |
 
 > On Mac, F1/F2 may control brightness by default. Go to System Settings → Keyboard → enable "Use F1, F2, etc. as standard function keys", or press Fn+F1 / Fn+F2.

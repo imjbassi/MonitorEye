@@ -3,12 +3,12 @@
 Monitor Eye (Mac Edition)
 ─────────────────────────
 F1  → Capture & Analyze
-F2  → Clear Telegram chat
+F2  → Clear answer
 Ctrl+Shift+Q → Quit
 """
 
-import anthropic
-import base64
+from claude_subscription import ClaudeSubscription
+from live_view import LiveView
 import html
 import io
 import json
@@ -29,9 +29,13 @@ from pynput import keyboard
 
 CAPTURE_HOTKEY = {keyboard.Key.f1}
 CLEAR_HOTKEY   = {keyboard.Key.f2}
+RETRY_HOTKEY   = {keyboard.Key.f3}
 QUIT_HOTKEY    = {keyboard.Key.ctrl_l, keyboard.Key.shift_l, keyboard.KeyCode.from_char('q')}
 
-MODEL = os.getenv("MODEL", "claude-sonnet-5")
+MODEL = os.getenv("MODEL", "claude-sonnet-5-5")
+EFFORT = os.getenv("CLAUDE_EFFORT", "medium")
+RETRY_MODEL = os.getenv("RETRY_MODEL", "claude-opus-5-5")
+RETRY_EFFORT = os.getenv("RETRY_EFFORT", "high")
 
 # ── Capture source ──────────────────────────────────────────
 # "screen"  → grab the whole Mac display with `screencapture` (default)
@@ -48,7 +52,10 @@ VIDEO_PIXEL_FORMAT = os.getenv("VIDEO_PIXEL_FORMAT", "uyvy422")
 
 # Seconds to wait before a SCREEN capture so you can switch windows.
 # Not used for device capture (external feed needs no switch), so it's ~instant.
-CAPTURE_DELAY = float(os.getenv("CAPTURE_DELAY", "3"))
+CAPTURE_DELAY = float(os.getenv("CAPTURE_DELAY", "0"))
+TELEGRAM_ENABLED = os.getenv("TELEGRAM_ENABLED", "0") == "1"
+LIVE_PORT = int(os.getenv("LIVE_PORT", "8765"))
+live_view = None
 
 SYSTEM_PROMPT = (
     "You are an expert software engineering interview coach and coding assistant. "
@@ -412,63 +419,33 @@ def clear_telegram():
 
 
 # ============================================================
-#  CLAUDE API
+#  CLAUDE SUBSCRIPTION (Claude Code)
 # ============================================================
 
 client = None
 
+
 def init_client():
     global client
     try:
-        client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY", ""))
-    except Exception as e:
-        print(f"  API client error: {e}")
+        client = ClaudeSubscription(model=MODEL, timeout=float(os.getenv("CLAUDE_TIMEOUT", "120")), effort=EFFORT)
+        client.check_auth()
+        print("  Claude Code ready (Claude account login; subscription limits apply)")
+    except (RuntimeError, ValueError) as e:
+        print(f"  Claude setup error: {e}")
         sys.exit(1)
 
-    # Validate the key NOW, not on the first F1 mid-interview.
-    try:
-        client.models.list(limit=1)
-        print("  Claude API client ready (key valid)")
-    except anthropic.AuthenticationError:
-        print("  ✗ ANTHROPIC_API_KEY is invalid or revoked — fix .env and restart.")
-        sys.exit(1)
-    except Exception as e:
-        # Network hiccup etc. — warn but don't block startup.
-        print(f"  Claude API client ready (key not verified: {e})")
 
-
-def analyze_image(jpeg_bytes: bytes, ocr_text: str = "") -> str:
-    img_b64 = base64.standard_b64encode(jpeg_bytes).decode("utf-8")
+def analyze_image(jpeg_bytes: bytes, ocr_text: str = "", on_text=None, retry=False) -> str:
     prompt = USER_PROMPT
     if ocr_text:
         prompt += f"\n\nHere is the exact text extracted from the screen via OCR — use this for accuracy:\n\n{ocr_text}"
     try:
-        response = client.messages.create(
-            model=MODEL,
-            max_tokens=1024,
-            temperature=0,
-            system=SYSTEM_PROMPT,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/jpeg",
-                            "data": img_b64,
-                        },
-                    },
-                    {
-                        "type": "text",
-                        "text": prompt,
-                    },
-                ],
-            }],
-        )
-        return "".join(block.text for block in response.content if block.type == "text")
-    except anthropic.APIError as e:
-        return f"API Error: {e}"
+        return client.analyze(jpeg_bytes, prompt, SYSTEM_PROMPT, on_text=on_text,
+                              model=RETRY_MODEL if retry else MODEL,
+                              effort=RETRY_EFFORT if retry else EFFORT)
+    except RuntimeError as e:
+        return f"Claude Error: {e}"
     except Exception as e:
         return f"Error: {e}"
 
@@ -479,55 +456,98 @@ def analyze_image(jpeg_bytes: bytes, ocr_text: str = "") -> str:
 
 current_keys = set()
 capturing = False
+last_capture = None
 
 
 def on_press(key):
-    global capturing
+    global capturing, last_capture
+    if key in current_keys:
+        return  # Ignore key-repeat; one request per physical press.
     current_keys.add(key)
 
     if QUIT_HOTKEY.issubset(current_keys):
         print("\nQuitting Monitor Eye.")
         return False
 
-    if CLEAR_HOTKEY.issubset(current_keys):
-        threading.Thread(target=clear_telegram, daemon=True).start()
+    if CLEAR_HOTKEY.issubset(current_keys) and not capturing:
+        last_capture = None
+        if live_view:
+            live_view.update(text="", status="Ready — press F1 on your Mac", timing="")
+        if TELEGRAM_ENABLED:
+            threading.Thread(target=clear_telegram, daemon=True).start()
+
+    if RETRY_HOTKEY.issubset(current_keys) and not capturing:
+        if last_capture is None:
+            print("Capture with F1 before retrying with F3.")
+            return
+        capturing = True
+        threading.Thread(target=run_pipeline, kwargs={"retry": True}, daemon=True).start()
+        return
 
     if CAPTURE_HOTKEY.issubset(current_keys) and not capturing:
         capturing = True
-        run_pipeline()
-        capturing = False
+        threading.Thread(target=run_pipeline, daemon=True).start()
 
 
 def on_release(key):
     current_keys.discard(key)
 
 
-def run_pipeline():
-    print("\n" + "=" * 60)
-    print("CAPTURING...")
-    print("=" * 60)
+def run_pipeline(retry=False):
+    global capturing, last_capture
+    start = time.monotonic()
+    first_text = None
+    if live_view:
+        live_view.update(text="", status="Retrying last capture…" if retry else "Capturing…", timing="")
 
-    start = time.time()
+    def receive(text):
+        nonlocal first_text
+        if text and first_text is None:
+            first_text = time.monotonic() - start
+            print(f"  First text in {first_text:.1f}s")
+        if live_view:
+            live_view.append(text)
 
-    jpeg_bytes = capture_obs_window()
-    if not jpeg_bytes:
-        print("  Capture failed. Try again.")
-        return
-
-    ocr_text = ocr_screenshot()
-
-    print("Sending to Claude...")
-    response = analyze_image(jpeg_bytes, ocr_text)
-    elapsed = time.time() - start
-
-    threading.Thread(target=send_telegram, args=(response,), daemon=True).start()
-
-    print("\n" + "-" * 60)
-    print(response)
-    print("-" * 60)
-    print(f"Done in {elapsed:.1f}s")
-    print("=" * 60)
-    print(f"\nReady — F1 capture | F2 clear Telegram")
+    try:
+        if retry:
+            if last_capture is None:
+                raise RuntimeError("Capture with F1 before retrying with F3.")
+            jpeg_bytes, ocr_text = last_capture
+            captured = ocr_done = start
+        else:
+            last_capture = None
+            jpeg_bytes = capture_obs_window()
+            if not jpeg_bytes:
+                raise RuntimeError("Capture failed. Check macOS Screen Recording or Camera permission.")
+            captured = time.monotonic()
+            if live_view:
+                live_view.update(status="Reading screenshot…")
+            ocr_text = ocr_screenshot()
+            ocr_done = time.monotonic()
+            last_capture = (jpeg_bytes, ocr_text)
+        label = f"{RETRY_MODEL} · {RETRY_EFFORT}" if retry else f"{MODEL} · {EFFORT}"
+        if live_view:
+            live_view.update(status=f"{label} — thinking…", timing=label)
+        response = analyze_image(jpeg_bytes, ocr_text, on_text=receive, retry=retry)
+        elapsed = time.monotonic() - start
+        timing = label + (" · Reused capture" if retry else f" · Capture {captured-start:.1f}s · OCR {ocr_done-captured:.1f}s")
+        if first_text is not None:
+            timing += f" · First text {first_text:.1f}s"
+        timing += f" · Total {elapsed:.1f}s"
+        failed = response.startswith(("Claude Error:", "Error:"))
+        if live_view:
+            live_view.update(text=response, status="Request failed" if failed else "Done", timing=timing)
+        if TELEGRAM_ENABLED:
+            threading.Thread(target=send_telegram, args=(response,), daemon=True).start()
+        print(response)
+        print(timing)
+    except Exception as exc:
+        print(f"  Error: {exc}")
+        if live_view:
+            live_view.update(status="Request failed", text=str(exc))
+    finally:
+        capturing = False
+        print("Ready — F1 capture | F2 clear answer | F3 retry with Opus")
 
 
 # ============================================================
@@ -569,6 +589,11 @@ def test_capture():
 
 
 def main():
+    global live_view
+    if "--test-claude" in sys.argv:
+        init_client()
+        return
+
     if "--test-capture" in sys.argv:
         test_capture()
         return
@@ -578,23 +603,31 @@ def main():
     ║       Monitor Eye (Mac Edition)      ║
     ╠══════════════════════════════════════╣
     ║  F1  →  Capture & Analyze            ║
-    ║  F2  →  Clear Telegram chat          ║
+    ║  F2  →  Clear live answer            ║
+    ║  F3  →  Retry last capture with Opus ║
     ║  Ctrl+Shift+Q  →  Quit               ║
     ╚══════════════════════════════════════╝
     """)
 
     print("Starting up...")
     init_client()
+    live_view = LiveView(port=LIVE_PORT).start()
+    print(f"\n  iPhone (same Wi-Fi): {live_view.phone_url()}")
+    print(f"  This Mac: {live_view.url()}")
+    print("  Keep the private viewer link open in Safari. It changes each restart.")
     _init_vision()  # warm the OCR framework so the first capture isn't slow
     if CAPTURE_SOURCE == "device":
         print(f"  Capture source: device '{VIDEO_DEVICE}' "
               f"({VIDEO_SIZE}@{VIDEO_FRAMERATE}, {VIDEO_PIXEL_FORMAT})")
     else:
         print(f"  Capture source: screen ({CAPTURE_DELAY:.0f}s delay)")
-    print(f"\n  Ready. F1 to capture, F2 to clear Telegram.\n")
+    print(f"\n  Ready. F1 to capture, F2 to clear the answer. F3 to retry with Opus.\n")
 
-    with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
-        listener.join()
+    try:
+        with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
+            listener.join()
+    finally:
+        live_view.close()
 
 
 if __name__ == "__main__":

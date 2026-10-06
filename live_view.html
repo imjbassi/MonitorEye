@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="theme-color" content="#10151e"><title>MonitorEye Live</title>
+<style>
+:root{color-scheme:dark;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#10151e;color:#e8edf5}*{box-sizing:border-box}body{margin:0;padding:max(24px,env(safe-area-inset-top)) 20px 40px;max-width:860px;margin:auto}header{display:flex;align-items:center;justify-content:space-between}h1{font-size:23px;letter-spacing:-.7px}#connection{font-size:12px;color:#8ca4bd}#status{color:#71ddc2;margin:22px 0 8px}#timing{color:#91a0b4;font-size:12px;min-height:18px}article{font-size:18px;line-height:1.65;overflow-wrap:anywhere}p{white-space:pre-wrap}pre{background:#080d14;border:1px solid #283444;border-radius:12px;padding:16px;overflow:auto;font-size:14px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;max-width:100%;tab-size:4}button{background:#202c3c;color:#e8edf5;border:1px solid #36465b;border-radius:9px;padding:9px 13px;font:inherit;font-size:13px}footer{color:#91a0b4;font-size:13px;margin-top:30px}.empty{color:#91a0b4;margin-top:40px}
+@media (max-width:480px){body{padding-left:12px;padding-right:12px}pre{padding:12px;font-size:13px;line-height:1.55}}
+</style>
+<header><h1>MonitorEye <span style="color:#71ddc2">Live</span></h1><span id="connection">Connecting…</span></header>
+<div id="status">Ready</div><div id="timing"></div><article id="answer"><p class="empty">Keep this page open. Press F1 on your Mac to see the answer appear here.</p></article>
+<footer><button id="copy">Copy answer</button><span style="margin-left:12px">F1 capture · F2 clear · F3 Opus retry</span></footer>
+<script>
+const $=id=>document.getElementById(id);let answer='',scheduled=false;
+function render(){scheduled=false;const el=$('answer');el.replaceChildren();if(!answer){const p=document.createElement('p');p.className='empty';p.textContent='Keep this page open. Press F1 on your Mac to see the answer appear here.';el.append(p);return}answer.split('```').forEach((part,i)=>{const node=document.createElement(i%2?'pre':'p');node.textContent=i%2?part.replace(/^[\w+#.-]*\n/,''):part;el.append(node)})}
+const query=new URLSearchParams(location.search),token=query.get('token');
+const stream=new EventSource('/events?token='+encodeURIComponent(token||''));
+stream.onopen=()=>{$('connection').textContent='Connected';};
+stream.onerror=()=>{$('connection').textContent='Reconnecting…';};
+stream.onmessage=event=>{const state=JSON.parse(event.data);$('status').textContent=state.status;$('timing').textContent=state.timing;answer=state.text;if(!scheduled){scheduled=true;requestAnimationFrame(render)}};
+$('copy').onclick=async()=>{try{if(navigator.clipboard&&window.isSecureContext){await navigator.clipboard.writeText(answer)}else{const t=document.createElement('textarea');t.value=answer;document.body.append(t);t.select();t.setSelectionRange(0,t.value.length);if(!document.execCommand('copy'))throw Error();t.remove()}$('copy').textContent='Copied';}catch{$('copy').textContent='Select text to copy'}setTimeout(()=>$('copy').textContent='Copy answer',1800)};
+</script></html>
